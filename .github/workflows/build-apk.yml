@@ -1,5 +1,5 @@
-name: Build Android APK
-# Single-file build: drop this at .github/workflows/build-apk.yml, push, run it from the Actions tab.
+name: Build Auto Voicemail APK
+# Put this file at .github/workflows/build-apk.yml, commit, then open Actions > Run workflow.
 on:
   workflow_dispatch:
   push:
@@ -23,7 +23,7 @@ jobs:
               repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
               repositories { google(); mavenCentral() }
           }
-          rootProject.name = 'VoicemailControl'
+          rootProject.name = 'AutoVoicemail'
           include ':app'
           EOF
           cat > build.gradle <<'EOF'
@@ -41,10 +41,10 @@ jobs:
               compileSdk 34
               defaultConfig {
                   applicationId 'com.example.voicemailctl'
-                  minSdk 24
+                  minSdk 26
                   targetSdk 34
-                  versionCode 1
-                  versionName '1.0'
+                  versionCode 3
+                  versionName '3.0'
               }
               compileOptions {
                   sourceCompatibility JavaVersion.VERSION_17
@@ -57,7 +57,18 @@ jobs:
           <?xml version="1.0" encoding="utf-8"?>
           <manifest xmlns:android="http://schemas.android.com/apk/res/android">
               <uses-permission android:name="android.permission.INTERNET" />
-              <application android:label="Voicemail Control"
+              <uses-permission android:name="android.permission.RECORD_AUDIO" />
+              <uses-permission android:name="android.permission.READ_PHONE_STATE" />
+              <uses-permission android:name="android.permission.READ_CALL_LOG" />
+              <uses-permission android:name="android.permission.ANSWER_PHONE_CALLS" />
+              <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+              <queries>
+                  <intent><action android:name="android.intent.action.TTS_SERVICE" /></intent>
+              </queries>
+              <application android:label="Auto Voicemail"
                   android:theme="@android:style/Theme.Material.Light.DarkActionBar">
                   <activity android:name=".MainActivity" android:exported="true">
                       <intent-filter>
@@ -65,31 +76,73 @@ jobs:
                           <category android:name="android.intent.category.LAUNCHER" />
                       </intent-filter>
                   </activity>
+                  <service android:name=".VoicemailService" android:exported="false"
+                      android:foregroundServiceType="microphone" />
+                  <service android:name=".CallNotificationListener" android:exported="true"
+                      android:permission="android.permission.BIND_NOTIFICATION_LISTENER_SERVICE">
+                      <intent-filter>
+                          <action android:name="android.service.notification.NotificationListenerService" />
+                      </intent-filter>
+                  </service>
+                  <service android:name=".AnswerAccessibilityService" android:exported="true"
+                      android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+                      <intent-filter>
+                          <action android:name="android.accessibilityservice.AccessibilityService" />
+                      </intent-filter>
+                      <meta-data android:name="android.accessibilityservice"
+                          android:resource="@xml/accessibility_config" />
+                  </service>
               </application>
           </manifest>
+          EOF
+          mkdir -p app/src/main/res/values
+          cat > app/src/main/res/values/strings.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <string name="a11y_desc">Lets Auto Voicemail tap the Answer button when a call is not picked up.</string>
+          </resources>
+          EOF
+          mkdir -p app/src/main/res/xml
+          cat > app/src/main/res/xml/accessibility_config.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+              android:accessibilityEventTypes="typeWindowStateChanged"
+              android:accessibilityFeedbackType="feedbackGeneric"
+              android:accessibilityFlags="flagRetrieveInteractiveWindows|flagReportViewIds"
+              android:canRetrieveWindowContent="true"
+              android:notificationTimeout="100"
+              android:description="@string/a11y_desc" />
           EOF
           mkdir -p app/src/main/java/com/example/voicemailctl
           cat > app/src/main/java/com/example/voicemailctl/MainActivity.java <<'EOF'
           package com.example.voicemailctl;
 
+          import android.Manifest;
           import android.app.Activity;
           import android.content.Intent;
           import android.content.SharedPreferences;
+          import android.content.pm.PackageManager;
           import android.net.Uri;
+          import android.os.Build;
           import android.os.Bundle;
+          import android.os.PowerManager;
+          import android.content.ClipData;
+          import android.content.ClipboardManager;
+          import android.graphics.Typeface;
+          import android.provider.Settings;
           import android.text.InputType;
           import android.view.View;
           import android.widget.*;
-          import org.json.JSONObject;
           import java.io.*;
           import java.net.HttpURLConnection;
           import java.net.URL;
+          import java.net.URLEncoder;
 
           public class MainActivity extends Activity {
-              private static final int PICK = 1;
+              private static final int PICK = 1, PERM = 2;
               private SharedPreferences sp;
-              private EditText url, token, number, delay, text;
-              private TextView status;
+              private EditText token, chat, delay, text, lang;
+              private TextView status, logView;
 
               @Override protected void onCreate(Bundle b) {
                   super.onCreate(b);
@@ -100,39 +153,59 @@ jobs:
                   int p = dp(16); root.setPadding(p, p, p, p);
                   sv.addView(root);
 
-                  label(root, "Backend");
-                  url = field(root, "Server URL, e.g. https://my-voicemail.fly.dev", "url", false);
-                  token = field(root, "Admin token", "token", true);
-                  label(root, "Call forwarding");
-                  number = field(root, "Virtual number, e.g. +919XXXXXXXXX", "number", false);
-                  delay = field(root, "Ring delay seconds (5-30, step 5)", "delay", false);
-                  if (delay.getText().length() == 0) delay.setText("20");
+                  label(root, "1. Telegram");
+                  token = field(root, "Bot token", "token", "", true);
+                  chat = field(root, "Your chat ID", "chat", "", false);
+                  btn(root, "Send Telegram test", v -> telegramTest());
+
+                  label(root, "2. Greeting");
+                  delay = field(root, "Ring seconds before answering (use 12)", "delay", "12", false);
                   delay.setInputType(InputType.TYPE_CLASS_NUMBER);
-
-                  btn(root, "Forward when NO ANSWER", v -> dial("**61*" + num() + "**" + sec() + "#"));
-                  btn(root, "Forward when BUSY", v -> dial("**67*" + num() + "#"));
-                  btn(root, "Forward when UNREACHABLE", v -> dial("**62*" + num() + "#"));
-                  btn(root, "Check no-answer status", v -> dial("*#61#"));
-                  btn(root, "Cancel ALL forwarding", v -> dial("##002#"));
-
-                  label(root, "Greeting");
-                  text = field(root, "Greeting text (TTS)", "text", false);
-                  text.setMinLines(3);
-                  btn(root, "Generate greeting from text", v -> sendText());
-                  btn(root, "Upload MP3 greeting", v -> {
-                      save();
+                  text = field(root, "Greeting text", "text",
+                          "Hi, I'm currently unavailable. Please leave your message after the beep.", false);
+                  lang = field(root, "Voice language (en-IN or hi-IN)", "lang", "en-IN", false);
+                  btn(root, "Use my own MP3 greeting (optional)", v -> {
                       Intent i = new Intent(Intent.ACTION_GET_CONTENT);
                       i.setType("audio/*");
                       startActivityForResult(i, PICK);
                   });
+                  btn(root, "Remove MP3 (use text greeting)", v -> {
+                      new File(getFilesDir(), "greeting.mp3").delete(); msg("MP3 removed.");
+                  });
+
+                  label(root, "3. Run");
+                  btn(root, "START auto voicemail", v -> startSvc());
+                  btn(root, "STOP", v -> { stopService(new Intent(this, VoicemailService.class)); msg("Stopped."); });
+                  btn(root, "Allow background running (battery)", v ->
+                          startActivity(new Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS)));
+
+                  btn(root, "Allow notification access (backup answer method)", v ->
+                          startActivity(new Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS)));
+
+                  btn(root, "Enable accessibility (strongest backup)", v ->
+                          startActivity(new Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)));
+
+                  label(root, "4. Diagnostics");
+                  btn(root, "Check status", v -> checkStatus());
+                  btn(root, "Refresh log", v -> logView.setText(VmLog.get(this)));
+                  btn(root, "Copy log", v -> {
+                      ((ClipboardManager) getSystemService(CLIPBOARD_SERVICE))
+                              .setPrimaryClip(ClipData.newPlainText("log", VmLog.get(this)));
+                      msg("Log copied.");
+                  });
+                  btn(root, "Clear log", v -> { VmLog.clear(this); logView.setText(""); });
 
                   status = new TextView(this);
                   status.setPadding(0, dp(12), 0, 0);
                   root.addView(status);
+                  logView = new TextView(this);
+                  logView.setTypeface(Typeface.MONOSPACE);
+                  logView.setTextSize(12);
+                  logView.setTextIsSelectable(true);
+                  root.addView(logView);
                   setContentView(sv);
               }
 
-              // ---------- UI helpers ----------
               private int dp(int v) { return (int) (v * getResources().getDisplayMetrics().density); }
 
               private void label(LinearLayout r, String s) {
@@ -141,11 +214,10 @@ jobs:
                   r.addView(t);
               }
 
-              private EditText field(LinearLayout r, String hint, String key, boolean secret) {
+              private EditText field(LinearLayout r, String hint, String key, String def, boolean secret) {
                   EditText e = new EditText(this);
                   e.setHint(hint);
-                  e.setText(sp.getString(key, ""));
-                  e.setTag(key);
+                  e.setText(sp.getString(key, def));
                   if (secret) e.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_PASSWORD);
                   r.addView(e);
                   return e;
@@ -157,87 +229,554 @@ jobs:
                   r.addView(b);
               }
 
-              private void save() {
-                  sp.edit().putString("url", url.getText().toString().trim())
-                          .putString("token", token.getText().toString().trim())
-                          .putString("number", number.getText().toString().trim())
-                          .putString("delay", delay.getText().toString().trim())
-                          .putString("text", text.getText().toString()).apply();
+              @Override protected void onResume() {
+                  super.onResume();
+                  if (logView != null) logView.setText(VmLog.get(this));
+              }
+
+              private void checkStatus() {
+                  StringBuilder s = new StringBuilder();
+                  s.append(Build.MANUFACTURER).append(' ').append(Build.MODEL)
+                          .append(", Android ").append(Build.VERSION.RELEASE)
+                          .append(" (API ").append(Build.VERSION.SDK_INT).append(")\n");
+                  String[] ps = {Manifest.permission.RECORD_AUDIO, Manifest.permission.READ_PHONE_STATE,
+                          Manifest.permission.ANSWER_PHONE_CALLS, Manifest.permission.READ_CALL_LOG};
+                  for (String p : ps)
+                      s.append(p.substring(p.lastIndexOf('.') + 1)).append(": ")
+                              .append(checkSelfPermission(p) == PackageManager.PERMISSION_GRANTED ? "YES" : "NO").append('\n');
+                  s.append("Service running: ").append(VoicemailService.running ? "YES" : "NO").append('\n');
+                  String en = Settings.Secure.getString(getContentResolver(), "enabled_notification_listeners");
+                  s.append("Notification access: ").append(en != null && en.contains(getPackageName()) ? "YES" : "NO").append('\n');
+                  String ea = Settings.Secure.getString(getContentResolver(), "enabled_accessibility_services");
+                  s.append("Accessibility: ").append(ea != null && ea.contains(getPackageName()) ? "YES" : "NO").append('\n');
+                  s.append("Battery unrestricted: ").append(((PowerManager) getSystemService(POWER_SERVICE))
+                          .isIgnoringBatteryOptimizations(getPackageName()) ? "YES" : "NO");
+                  msg(s.toString());
+                  VmLog.add(this, "STATUS " + s.toString().replace('\n', '|'));
+                  logView.setText(VmLog.get(this));
               }
 
               private void msg(String s) { runOnUiThread(() -> status.setText(s)); }
 
-              // ---------- forwarding (opens the dialer; you press Call and pick the SIM) ----------
-              private String num() {
-                  String n = number.getText().toString().replaceAll("[\\s-]", "");
-                  if (n.matches("\\d{10}")) n = "+91" + n;
-                  return n;
+              private void save() {
+                  sp.edit().putString("token", token.getText().toString().trim())
+                          .putString("chat", chat.getText().toString().trim())
+                          .putString("delay", delay.getText().toString().trim())
+                          .putString("text", text.getText().toString().trim())
+                          .putString("lang", lang.getText().toString().trim()).apply();
               }
 
-              private int sec() {
-                  int s;
-                  try { s = Integer.parseInt(delay.getText().toString().trim()); } catch (Exception e) { s = 20; }
-                  s = Math.max(5, Math.min(30, s));
-                  return (s / 5) * 5;
+              // ---------- permissions + start ----------
+              private boolean core() {
+                  String[] need = {Manifest.permission.RECORD_AUDIO, Manifest.permission.READ_PHONE_STATE,
+                          Manifest.permission.ANSWER_PHONE_CALLS};
+                  for (String p : need)
+                      if (checkSelfPermission(p) != PackageManager.PERMISSION_GRANTED) return false;
+                  return true;
               }
 
-              private void dial(String code) {
+              private void startSvc() {
                   save();
-                  if (code.contains("**6") && num().length() < 10) { msg("Enter the virtual number first."); return; }
-                  startActivity(new Intent(Intent.ACTION_DIAL, Uri.parse("tel:" + Uri.encode(code))));
-                  msg("Dialer opened with " + code + "\nPress Call and choose your Airtel/Jio SIM.");
+                  if (token.getText().length() < 10 || chat.getText().length() < 3) {
+                      msg("Enter bot token and chat ID first."); return;
+                  }
+                  if (!core()) {
+                      String[] all = Build.VERSION.SDK_INT >= 33
+                              ? new String[]{Manifest.permission.RECORD_AUDIO, Manifest.permission.READ_PHONE_STATE,
+                              Manifest.permission.ANSWER_PHONE_CALLS, Manifest.permission.READ_CALL_LOG,
+                              "android.permission.POST_NOTIFICATIONS"}
+                              : new String[]{Manifest.permission.RECORD_AUDIO, Manifest.permission.READ_PHONE_STATE,
+                              Manifest.permission.ANSWER_PHONE_CALLS, Manifest.permission.READ_CALL_LOG};
+                      requestPermissions(all, PERM);
+                      return;
+                  }
+                  startForegroundService(new Intent(this, VoicemailService.class));
+                  msg("Auto voicemail is ON. Unanswered calls will be picked up after "
+                          + delay.getText() + "s.");
               }
 
-              // ---------- greeting admin API ----------
-              private void sendText() {
-                  save();
-                  final String t = text.getText().toString();
-                  msg("Generating...");
-                  new Thread(() -> {
-                      try {
-                          byte[] body = new JSONObject().put("text", t).toString().getBytes("UTF-8");
-                          msg("Server replied: " + post("/admin/greeting-text", "application/json", body));
-                      } catch (Exception e) { msg("Error: " + e); }
-                  }).start();
+              @Override public void onRequestPermissionsResult(int code, String[] p, int[] r) {
+                  super.onRequestPermissionsResult(code, p, r);
+                  if (core()) startSvc();
+                  else msg("Please allow Microphone, Phone and Answer-calls permissions in app settings.");
               }
 
+              // ---------- MP3 greeting ----------
               @Override protected void onActivityResult(int req, int res, Intent data) {
                   super.onActivityResult(req, res, data);
                   if (req != PICK || res != RESULT_OK || data == null) return;
-                  final Uri u = data.getData();
-                  msg("Uploading...");
+                  try {
+                      InputStream in = getContentResolver().openInputStream(data.getData());
+                      OutputStream out = new FileOutputStream(new File(getFilesDir(), "greeting.mp3"));
+                      byte[] buf = new byte[8192]; int n;
+                      while ((n = in.read(buf)) > 0) out.write(buf, 0, n);
+                      in.close(); out.close();
+                      msg("MP3 greeting saved.");
+                  } catch (Exception e) { msg("Could not read file: " + e); }
+              }
+
+              // ---------- Telegram test ----------
+              private void telegramTest() {
+                  save();
+                  msg("Sending...");
                   new Thread(() -> {
                       try {
-                          InputStream in = getContentResolver().openInputStream(u);
-                          ByteArrayOutputStream f = new ByteArrayOutputStream();
-                          byte[] buf = new byte[8192]; int n;
-                          while ((n = in.read(buf)) > 0) f.write(buf, 0, n);
-                          in.close();
-                          String B = "----vm" + System.currentTimeMillis();
-                          ByteArrayOutputStream body = new ByteArrayOutputStream();
-                          body.write(("--" + B + "\r\nContent-Disposition: form-data; name=\"file\"; "
-                                  + "filename=\"greeting.mp3\"\r\nContent-Type: audio/mpeg\r\n\r\n").getBytes("UTF-8"));
-                          body.write(f.toByteArray());
-                          body.write(("\r\n--" + B + "--\r\n").getBytes("UTF-8"));
-                          msg("Server replied: " + post("/admin/greeting", "multipart/form-data; boundary=" + B, body.toByteArray()));
+                          String body = "chat_id=" + URLEncoder.encode(chat.getText().toString().trim(), "UTF-8")
+                                  + "&text=" + URLEncoder.encode("Auto Voicemail test OK", "UTF-8");
+                          HttpURLConnection c = (HttpURLConnection) new URL("https://api.telegram.org/bot"
+                                  + token.getText().toString().trim() + "/sendMessage").openConnection();
+                          c.setRequestMethod("POST"); c.setDoOutput(true);
+                          c.setConnectTimeout(15000); c.setReadTimeout(30000);
+                          c.getOutputStream().write(body.getBytes("UTF-8"));
+                          int code = c.getResponseCode();
+                          msg(code == 200 ? "Telegram OK - check your bot chat."
+                                  : "Telegram error " + code + ". Check token / chat ID, and press Start in the bot chat.");
                       } catch (Exception e) { msg("Error: " + e); }
                   }).start();
               }
+          }
+          EOF
+          mkdir -p app/src/main/java/com/example/voicemailctl
+          cat > app/src/main/java/com/example/voicemailctl/VoicemailService.java <<'EOF'
+          package com.example.voicemailctl;
 
-              private String post(String path, String type, byte[] body) throws IOException {
-                  String base = url.getText().toString().trim().replaceAll("/+$", "");
-                  HttpURLConnection c = (HttpURLConnection) new URL(base + path).openConnection();
-                  c.setRequestMethod("POST");
-                  c.setDoOutput(true);
-                  c.setConnectTimeout(15000);
-                  c.setReadTimeout(90000);
-                  c.setRequestProperty("Content-Type", type);
-                  c.setRequestProperty("X-Admin-Token", token.getText().toString().trim());
-                  c.setFixedLengthStreamingMode(body.length);
-                  OutputStream os = c.getOutputStream();
-                  os.write(body); os.close();
-                  int code = c.getResponseCode();
-                  return code == 200 ? "OK (200)" : "HTTP " + code;
+          import android.app.Notification;
+          import android.app.NotificationChannel;
+          import android.app.NotificationManager;
+          import android.app.Service;
+          import android.content.Intent;
+          import android.content.SharedPreferences;
+          import android.content.pm.ServiceInfo;
+          import android.media.AudioAttributes;
+          import android.media.AudioManager;
+          import android.media.MediaPlayer;
+          import android.media.MediaRecorder;
+          import android.media.ToneGenerator;
+          import android.os.Build;
+          import android.os.Handler;
+          import android.os.IBinder;
+          import android.os.Looper;
+          import android.telephony.TelephonyCallback;
+          import android.view.KeyEvent;
+          import android.speech.tts.TextToSpeech;
+          import android.speech.tts.UtteranceProgressListener;
+          import android.telecom.TelecomManager;
+          import android.telephony.PhoneStateListener;
+          import android.telephony.TelephonyManager;
+          import java.io.ByteArrayOutputStream;
+          import java.io.File;
+          import java.io.FileInputStream;
+          import java.io.InputStream;
+          import java.io.OutputStream;
+          import java.net.HttpURLConnection;
+          import java.net.URL;
+          import java.util.Locale;
+
+          public class VoicemailService extends Service {
+              private static final String CH = "vm";
+              private final Handler h = new Handler(Looper.getMainLooper());
+              private TelephonyManager tm;
+              private TelecomManager tc;
+              private AudioManager am;
+              private PhoneStateListener listener;
+              private SharedPreferences sp;
+              private TextToSpeech tts;
+              private boolean ttsReady;
+              private MediaPlayer mp;
+              private MediaRecorder rec;
+              private File recFile;
+              private boolean ringing, weAnswered, recording;
+              private String number = "Unknown";
+              private long startedAt;
+              static volatile boolean running;
+              private Object newCb;
+
+              private final Runnable answer = this::answerStep1;
+              private final Runnable answer2 = this::answerStep2;
+              private final Runnable answer3 = this::answerStep3;
+              private final Runnable answer4 = this::answerStep4;
+              private final Runnable answerFail = this::answerFailed;
+
+              private void answerStep1() {
+                  if (!ringing) return;
+                  weAnswered = true;
+                  VmLog.add(this, "Answer method 1: TelecomManager.acceptRingingCall");
+                  try { tc.acceptRingingCall(); } catch (Exception e) { VmLog.add(this, "method 1 error: " + e); }
+                  h.postDelayed(answer2, 1500);
+              }
+
+              private void answerStep2() {
+                  if (!ringing) return;
+                  VmLog.add(this, "Still ringing. Answer method 2: headset hook key");
+                  try {
+                      am.dispatchMediaKeyEvent(new KeyEvent(KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_HEADSETHOOK));
+                      am.dispatchMediaKeyEvent(new KeyEvent(KeyEvent.ACTION_UP, KeyEvent.KEYCODE_HEADSETHOOK));
+                  } catch (Exception e) { VmLog.add(this, "method 2 error: " + e); }
+                  h.postDelayed(answer3, 1500);
+              }
+
+              private void answerStep3() {
+                  if (!ringing) return;
+                  VmLog.add(this, "Still ringing. Answer method 3: notification Answer button");
+                  boolean ok = CallNotificationListener.answer(this);
+                  VmLog.add(this, "method 3 result: " + ok);
+                  h.postDelayed(answer4, 1500);
+              }
+
+              private void answerStep4() {
+                  if (!ringing) return;
+                  VmLog.add(this, "Still ringing. Answer method 4: accessibility tap");
+                  boolean ok = AnswerAccessibilityService.answer(this);
+                  VmLog.add(this, "method 4 result: " + ok);
+                  h.postDelayed(answerFail, 2000);
+              }
+
+              private void answerFailed() {
+                  if (!ringing) return;
+                  weAnswered = false;
+                  VmLog.add(this, "FAILED: could not answer. Press Check status and share the log.");
+              }
+
+              private final Runnable greet = this::playGreeting;
+              private final Runnable beepRec = this::startRec;
+              private final Runnable hardStop = () -> {
+                  if (Build.VERSION.SDK_INT >= 28) { try { tc.endCall(); } catch (Exception e) { } }
+              };
+
+              @Override public IBinder onBind(Intent i) { return null; }
+
+              @Override public void onCreate() {
+                  super.onCreate();
+                  sp = getSharedPreferences("cfg", MODE_PRIVATE);
+                  tm = (TelephonyManager) getSystemService(TELEPHONY_SERVICE);
+                  tc = (TelecomManager) getSystemService(TELECOM_SERVICE);
+                  am = (AudioManager) getSystemService(AUDIO_SERVICE);
+                  tts = new TextToSpeech(this, st -> ttsReady = (st == TextToSpeech.SUCCESS));
+                  running = true;
+                  VmLog.add(this, "Service started, API " + Build.VERSION.SDK_INT);
+                  listener = new PhoneStateListener() {
+                      @Override public void onCallStateChanged(int state, String num) { onState(state, num); }
+                  };
+                  tm.listen(listener, PhoneStateListener.LISTEN_CALL_STATE);
+                  if (Build.VERSION.SDK_INT >= 31) {
+                      try {
+                          CallCb cb = new CallCb();
+                          tm.registerTelephonyCallback(getMainExecutor(), cb);
+                          newCb = cb;
+                      } catch (Exception e) { VmLog.add(this, "registerTelephonyCallback error: " + e); }
+                  }
+              }
+
+              private class CallCb extends TelephonyCallback implements TelephonyCallback.CallStateListener {
+                  @Override public void onCallStateChanged(int state) { onState(state, null); }
+              }
+
+              @Override public int onStartCommand(Intent intent, int flags, int id) {
+                  NotificationManager nm = (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
+                  nm.createNotificationChannel(new NotificationChannel(CH, "Auto Voicemail", NotificationManager.IMPORTANCE_LOW));
+                  Notification n = new Notification.Builder(this, CH)
+                          .setContentTitle("Auto Voicemail is ON")
+                          .setContentText("Unanswered calls will be picked up")
+                          .setSmallIcon(android.R.drawable.ic_menu_call).build();
+                  if (Build.VERSION.SDK_INT >= 29)
+                      startForeground(1, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE);
+                  else startForeground(1, n);
+                  return START_STICKY;
+              }
+
+              @Override public void onDestroy() {
+                  running = false;
+                  VmLog.add(this, "Service stopped");
+                  if (Build.VERSION.SDK_INT >= 31 && newCb != null) tm.unregisterTelephonyCallback((TelephonyCallback) newCb);
+                  tm.listen(listener, PhoneStateListener.LISTEN_NONE);
+                  h.removeCallbacksAndMessages(null);
+                  if (recording) finishRecording();
+                  if (tts != null) tts.shutdown();
+                  super.onDestroy();
+              }
+
+              // ---------- call state machine ----------
+              private int delaySec() {
+                  try { return Math.max(3, Integer.parseInt(sp.getString("delay", "12"))); }
+                  catch (Exception e) { return 12; }
+              }
+
+              private void cancelAnswer() {
+                  h.removeCallbacks(answer); h.removeCallbacks(answer2);
+                  h.removeCallbacks(answer3); h.removeCallbacks(answer4); h.removeCallbacks(answerFail);
+              }
+
+              private void onState(int state, String num) {
+                  VmLog.add(this, "state=" + (state == 1 ? "RINGING" : state == 2 ? "OFFHOOK" : "IDLE"));
+                  if (state == TelephonyManager.CALL_STATE_RINGING) {
+                      if (num != null && !num.isEmpty()) number = num;
+                      if (!ringing) {
+                          ringing = true; weAnswered = false;
+                          VmLog.add(this, "Ringing; will answer in " + delaySec() + "s");
+                          h.postDelayed(answer, delaySec() * 1000L);
+                      }
+                  } else if (state == TelephonyManager.CALL_STATE_OFFHOOK) {
+                      ringing = false;
+                      cancelAnswer();
+                      if (weAnswered && !recording) { h.removeCallbacks(greet); h.postDelayed(greet, 900); }
+                  } else { // IDLE
+                      ringing = false;
+                      cancelAnswer(); h.removeCallbacks(greet);
+                      h.removeCallbacks(beepRec); h.removeCallbacks(hardStop);
+                      stopAudio();
+                      if (recording) finishRecording();
+                      if (weAnswered) am.setSpeakerphoneOn(false);
+                      weAnswered = false;
+                      number = "Unknown";
+                  }
+              }
+
+              // ---------- greeting ----------
+              private void playGreeting() {
+                  if (!weAnswered) return;
+                  VmLog.add(this, "Call answered; playing greeting");
+                  try {
+                      am.setSpeakerphoneOn(true);
+                      am.setStreamVolume(AudioManager.STREAM_VOICE_CALL,
+                              am.getStreamMaxVolume(AudioManager.STREAM_VOICE_CALL), 0);
+                      AudioAttributes aa = new AudioAttributes.Builder()
+                              .setUsage(AudioAttributes.USAGE_VOICE_COMMUNICATION)
+                              .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH).build();
+                      File g = new File(getFilesDir(), "greeting.mp3");
+                      if (g.exists()) {
+                          mp = new MediaPlayer();
+                          mp.setAudioAttributes(aa);
+                          mp.setDataSource(g.getPath());
+                          mp.setOnCompletionListener(m -> beepThenRecord());
+                          mp.prepare();
+                          mp.start();
+                      } else if (ttsReady) {
+                          tts.setAudioAttributes(aa);
+                          tts.setLanguage(Locale.forLanguageTag(sp.getString("lang", "en-IN")));
+                          tts.setOnUtteranceProgressListener(new UtteranceProgressListener() {
+                              @Override public void onStart(String id) { }
+                              @Override public void onDone(String id) { h.post(() -> beepThenRecord()); }
+                              @Override public void onError(String id) { h.post(() -> beepThenRecord()); }
+                          });
+                          tts.speak(sp.getString("text", "Please leave a message after the beep."),
+                                  TextToSpeech.QUEUE_FLUSH, null, "g");
+                      } else beepThenRecord();
+                  } catch (Exception e) { beepThenRecord(); }
+              }
+
+              private void stopAudio() {
+                  try { if (mp != null) { mp.release(); mp = null; } } catch (Exception e) { }
+                  try { if (tts != null) tts.stop(); } catch (Exception e) { }
+              }
+
+              private void beepThenRecord() {
+                  if (!weAnswered || recording) return;
+                  try { new ToneGenerator(AudioManager.STREAM_VOICE_CALL, 100).startTone(ToneGenerator.TONE_PROP_BEEP, 400); }
+                  catch (Exception e) { }
+                  h.postDelayed(beepRec, 700);
+              }
+
+              // ---------- recording ----------
+              private void startRec() {
+                  if (!weAnswered || recording) return;
+                  try {
+                      recFile = new File(getCacheDir(), "vm_" + System.currentTimeMillis() + ".m4a");
+                      rec = Build.VERSION.SDK_INT >= 31 ? new MediaRecorder(this) : new MediaRecorder();
+                      rec.setAudioSource(MediaRecorder.AudioSource.MIC);
+                      rec.setOutputFormat(MediaRecorder.OutputFormat.MPEG_4);
+                      rec.setAudioEncoder(MediaRecorder.AudioEncoder.AAC);
+                      rec.setAudioEncodingBitRate(64000);
+                      rec.setAudioSamplingRate(16000);
+                      rec.setOutputFile(recFile.getPath());
+                      rec.prepare();
+                      rec.start();
+                      recording = true;
+                      VmLog.add(this, "Recording started");
+                      startedAt = System.currentTimeMillis();
+                      h.postDelayed(hardStop, 180000);
+                  } catch (Exception e) { recording = false; VmLog.add(this, "Recording error: " + e); }
+              }
+
+              private void finishRecording() {
+                  recording = false;
+                  try { rec.stop(); } catch (Exception e) { }
+                  try { rec.release(); } catch (Exception e) { }
+                  rec = null;
+                  final File f = recFile;
+                  final String who = number;
+                  final long dur = (System.currentTimeMillis() - startedAt) / 1000;
+                  if (f != null && f.exists() && f.length() > 1000)
+                      new Thread(() -> upload(f, who, dur)).start();
+              }
+
+              // ---------- Telegram upload ----------
+              private void upload(File f, String who, long dur) {
+                  try {
+                      String B = "----vm" + System.currentTimeMillis();
+                      ByteArrayOutputStream body = new ByteArrayOutputStream();
+                      part(body, B, "chat_id", sp.getString("chat", ""));
+                      part(body, B, "caption", "\uD83D\uDCDE " + who + "\n\u23F1 " + dur + "s");
+                      body.write(("--" + B + "\r\nContent-Disposition: form-data; name=\"audio\"; filename=\""
+                              + f.getName() + "\"\r\nContent-Type: audio/mp4\r\n\r\n").getBytes("UTF-8"));
+                      InputStream in = new FileInputStream(f);
+                      byte[] buf = new byte[8192]; int n;
+                      while ((n = in.read(buf)) > 0) body.write(buf, 0, n);
+                      in.close();
+                      body.write(("\r\n--" + B + "--\r\n").getBytes("UTF-8"));
+                      byte[] data = body.toByteArray();
+                      HttpURLConnection c = (HttpURLConnection) new URL("https://api.telegram.org/bot"
+                              + sp.getString("token", "") + "/sendAudio").openConnection();
+                      c.setRequestMethod("POST"); c.setDoOutput(true);
+                      c.setConnectTimeout(20000); c.setReadTimeout(60000);
+                      c.setRequestProperty("Content-Type", "multipart/form-data; boundary=" + B);
+                      c.setFixedLengthStreamingMode(data.length);
+                      OutputStream os = c.getOutputStream(); os.write(data); os.close();
+                      int code = c.getResponseCode();
+                      VmLog.add(this, "Telegram upload HTTP " + code);
+                      if (code == 200) f.delete();
+                  } catch (Exception e) { VmLog.add(this, "Upload error: " + e); }
+              }
+
+              private void part(ByteArrayOutputStream o, String B, String k, String v) throws Exception {
+                  o.write(("--" + B + "\r\nContent-Disposition: form-data; name=\"" + k + "\"\r\n\r\n" + v + "\r\n").getBytes("UTF-8"));
+              }
+          }
+          EOF
+          mkdir -p app/src/main/java/com/example/voicemailctl
+          cat > app/src/main/java/com/example/voicemailctl/VmLog.java <<'EOF'
+          package com.example.voicemailctl;
+
+          import android.content.Context;
+          import android.content.SharedPreferences;
+          import java.text.SimpleDateFormat;
+          import java.util.Date;
+          import java.util.Locale;
+
+          final class VmLog {
+              static synchronized void add(Context c, String s) {
+                  SharedPreferences sp = c.getSharedPreferences("log", Context.MODE_PRIVATE);
+                  String line = new SimpleDateFormat("HH:mm:ss", Locale.US).format(new Date()) + " " + s + "\n";
+                  String all = sp.getString("l", "") + line;
+                  if (all.length() > 6000) all = all.substring(all.length() - 6000);
+                  sp.edit().putString("l", all).apply();
+              }
+              static String get(Context c) { return c.getSharedPreferences("log", Context.MODE_PRIVATE).getString("l", ""); }
+              static void clear(Context c) { c.getSharedPreferences("log", Context.MODE_PRIVATE).edit().clear().apply(); }
+          }
+          EOF
+          mkdir -p app/src/main/java/com/example/voicemailctl
+          cat > app/src/main/java/com/example/voicemailctl/CallNotificationListener.java <<'EOF'
+          package com.example.voicemailctl;
+
+          import android.app.Notification;
+          import android.content.Context;
+          import android.service.notification.NotificationListenerService;
+          import android.service.notification.StatusBarNotification;
+
+          public class CallNotificationListener extends NotificationListenerService {
+              static volatile CallNotificationListener inst;
+
+              @Override public void onListenerConnected() { inst = this; }
+              @Override public void onListenerDisconnected() { inst = null; }
+
+              /** Taps the "Answer" button of the incoming-call notification. */
+              static boolean answer(Context ctx) {
+                  CallNotificationListener l = inst;
+                  if (l == null) { VmLog.add(ctx, "notif: access not enabled"); return false; }
+                  try {
+                      for (StatusBarNotification sbn : l.getActiveNotifications()) {
+                          Notification n = sbn.getNotification();
+                          if (n.actions == null) continue;
+                          StringBuilder titles = new StringBuilder();
+                          Notification.Action pick = null;
+                          for (Notification.Action a : n.actions) {
+                              String t = String.valueOf(a.title);
+                              titles.append(t).append(',');
+                              String lt = t.toLowerCase();
+                              if (lt.contains("answer") || lt.contains("accept") || lt.contains("pick")) pick = a;
+                          }
+                          VmLog.add(ctx, "notif " + sbn.getPackageName() + " cat=" + n.category + " actions=" + titles);
+                          if (pick != null && (Notification.CATEGORY_CALL.equals(n.category)
+                                  || sbn.getPackageName().contains("dialer") || sbn.getPackageName().contains("incall")
+                                  || sbn.getPackageName().contains("phone") || sbn.getPackageName().contains("telecom"))) {
+                              pick.actionIntent.send();
+                              return true;
+                          }
+                      }
+                  } catch (Exception e) { VmLog.add(ctx, "notif error " + e); }
+                  return false;
+              }
+          }
+          EOF
+          mkdir -p app/src/main/java/com/example/voicemailctl
+          cat > app/src/main/java/com/example/voicemailctl/AnswerAccessibilityService.java <<'EOF'
+          package com.example.voicemailctl;
+
+          import android.accessibilityservice.AccessibilityService;
+          import android.content.Context;
+          import android.content.Intent;
+          import android.view.accessibility.AccessibilityEvent;
+          import android.view.accessibility.AccessibilityNodeInfo;
+          import android.view.accessibility.AccessibilityWindowInfo;
+          import java.util.List;
+
+          public class AnswerAccessibilityService extends AccessibilityService {
+              static volatile AnswerAccessibilityService inst;
+
+              @Override protected void onServiceConnected() { inst = this; }
+              @Override public boolean onUnbind(Intent i) { inst = null; return super.onUnbind(i); }
+              @Override public void onAccessibilityEvent(AccessibilityEvent e) { }
+              @Override public void onInterrupt() { }
+
+              private static final String[] WORDS = {"answer", "accept", "pick up", "\u0909\u0924\u094d\u0924\u0930", "\u091c\u0935\u093e\u092c", "\u0938\u094d\u0935\u0940\u0915\u093e\u0930"};
+
+              /** Finds and taps the Answer button on screen (dialer UI or heads-up notification). */
+              static boolean answer(Context ctx) {
+                  AnswerAccessibilityService s = inst;
+                  if (s == null) { VmLog.add(ctx, "a11y: service not enabled"); return false; }
+                  try {
+                      List<AccessibilityWindowInfo> wins = s.getWindows();
+                      VmLog.add(ctx, "a11y: windows=" + (wins == null ? 0 : wins.size()));
+                      if (wins != null) for (AccessibilityWindowInfo w : wins) {
+                          AccessibilityNodeInfo root = w.getRoot();
+                          if (root != null && tap(ctx, root)) return true;
+                      }
+                      AccessibilityNodeInfo r = s.getRootInActiveWindow();
+                      if (r != null && tap(ctx, r)) return true;
+                  } catch (Exception e) { VmLog.add(ctx, "a11y error " + e); }
+                  return false;
+              }
+
+              private static boolean tap(Context ctx, AccessibilityNodeInfo root) {
+                  for (String w : WORDS) {
+                      List<AccessibilityNodeInfo> l = root.findAccessibilityNodeInfosByText(w);
+                      if (l != null) for (AccessibilityNodeInfo n : l) {
+                          if (click(ctx, n, w)) return true;
+                      }
+                  }
+                  return byId(ctx, root);
+              }
+
+              private static boolean byId(Context ctx, AccessibilityNodeInfo n) {
+                  if (n == null) return false;
+                  String id = n.getViewIdResourceName();
+                  if (id != null && (id.toLowerCase().contains("answer") || id.toLowerCase().contains("accept"))
+                          && click(ctx, n, "id:" + id)) return true;
+                  for (int i = 0; i < n.getChildCount(); i++)
+                      if (byId(ctx, n.getChild(i))) return true;
+                  return false;
+              }
+
+              private static boolean click(Context ctx, AccessibilityNodeInfo n, String why) {
+                  AccessibilityNodeInfo c = n;
+                  while (c != null) {
+                      if (c.isClickable() && c.performAction(AccessibilityNodeInfo.ACTION_CLICK)) {
+                          VmLog.add(ctx, "a11y: clicked (" + why + ")");
+                          return true;
+                      }
+                      c = c.getParent();
+                  }
+                  return false;
               }
           }
           EOF
@@ -246,11 +785,11 @@ jobs:
         run: gradle assembleDebug --no-daemon
       - uses: actions/upload-artifact@v4
         with:
-          name: voicemail-control-apk
+          name: auto-voicemail-apk
           path: proj/app/build/outputs/apk/debug/app-debug.apk
-      - name: Publish to GitHub Release (easy phone download)
+      - name: Publish to GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release delete latest --yes --cleanup-tag --repo "$GITHUB_REPOSITORY" || true
-          gh release create latest proj/app/build/outputs/apk/debug/app-debug.apk --repo "$GITHUB_REPOSITORY" --title "Voicemail Control APK" --notes "Debug build" --target "$GITHUB_SHA"
+          gh release create latest proj/app/build/outputs/apk/debug/app-debug.apk --repo "$GITHUB_REPOSITORY" --title "Auto Voicemail APK" --notes "Debug build" --target "$GITHUB_SHA"
