@@ -1,0 +1,256 @@
+name: Build Android APK
+# Single-file build: drop this at .github/workflows/build-apk.yml, push, run it from the Actions tab.
+on:
+  workflow_dispatch:
+  push:
+    paths: ['.github/workflows/build-apk.yml']
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: '17' }
+      - uses: gradle/actions/setup-gradle@v4
+        with: { gradle-version: '8.7' }
+      - name: Generate Android project
+        run: |
+          mkdir -p proj && cd proj
+          cat > settings.gradle <<'EOF'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories { google(); mavenCentral() }
+          }
+          rootProject.name = 'VoicemailControl'
+          include ':app'
+          EOF
+          cat > build.gradle <<'EOF'
+          plugins { id 'com.android.application' version '8.5.2' apply false }
+          EOF
+          cat > gradle.properties <<'EOF'
+          org.gradle.jvmargs=-Xmx2g
+          android.useAndroidX=false
+          EOF
+          mkdir -p app
+          cat > app/build.gradle <<'EOF'
+          plugins { id 'com.android.application' }
+          android {
+              namespace 'com.example.voicemailctl'
+              compileSdk 34
+              defaultConfig {
+                  applicationId 'com.example.voicemailctl'
+                  minSdk 24
+                  targetSdk 34
+                  versionCode 1
+                  versionName '1.0'
+              }
+              compileOptions {
+                  sourceCompatibility JavaVersion.VERSION_17
+                  targetCompatibility JavaVersion.VERSION_17
+              }
+          }
+          EOF
+          mkdir -p app/src/main
+          cat > app/src/main/AndroidManifest.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.INTERNET" />
+              <application android:label="Voicemail Control"
+                  android:theme="@android:style/Theme.Material.Light.DarkActionBar">
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          EOF
+          mkdir -p app/src/main/java/com/example/voicemailctl
+          cat > app/src/main/java/com/example/voicemailctl/MainActivity.java <<'EOF'
+          package com.example.voicemailctl;
+
+          import android.app.Activity;
+          import android.content.Intent;
+          import android.content.SharedPreferences;
+          import android.net.Uri;
+          import android.os.Bundle;
+          import android.text.InputType;
+          import android.view.View;
+          import android.widget.*;
+          import org.json.JSONObject;
+          import java.io.*;
+          import java.net.HttpURLConnection;
+          import java.net.URL;
+
+          public class MainActivity extends Activity {
+              private static final int PICK = 1;
+              private SharedPreferences sp;
+              private EditText url, token, number, delay, text;
+              private TextView status;
+
+              @Override protected void onCreate(Bundle b) {
+                  super.onCreate(b);
+                  sp = getSharedPreferences("cfg", MODE_PRIVATE);
+                  ScrollView sv = new ScrollView(this);
+                  LinearLayout root = new LinearLayout(this);
+                  root.setOrientation(LinearLayout.VERTICAL);
+                  int p = dp(16); root.setPadding(p, p, p, p);
+                  sv.addView(root);
+
+                  label(root, "Backend");
+                  url = field(root, "Server URL, e.g. https://my-voicemail.fly.dev", "url", false);
+                  token = field(root, "Admin token", "token", true);
+                  label(root, "Call forwarding");
+                  number = field(root, "Virtual number, e.g. +919XXXXXXXXX", "number", false);
+                  delay = field(root, "Ring delay seconds (5-30, step 5)", "delay", false);
+                  if (delay.getText().length() == 0) delay.setText("20");
+                  delay.setInputType(InputType.TYPE_CLASS_NUMBER);
+
+                  btn(root, "Forward when NO ANSWER", v -> dial("**61*" + num() + "**" + sec() + "#"));
+                  btn(root, "Forward when BUSY", v -> dial("**67*" + num() + "#"));
+                  btn(root, "Forward when UNREACHABLE", v -> dial("**62*" + num() + "#"));
+                  btn(root, "Check no-answer status", v -> dial("*#61#"));
+                  btn(root, "Cancel ALL forwarding", v -> dial("##002#"));
+
+                  label(root, "Greeting");
+                  text = field(root, "Greeting text (TTS)", "text", false);
+                  text.setMinLines(3);
+                  btn(root, "Generate greeting from text", v -> sendText());
+                  btn(root, "Upload MP3 greeting", v -> {
+                      save();
+                      Intent i = new Intent(Intent.ACTION_GET_CONTENT);
+                      i.setType("audio/*");
+                      startActivityForResult(i, PICK);
+                  });
+
+                  status = new TextView(this);
+                  status.setPadding(0, dp(12), 0, 0);
+                  root.addView(status);
+                  setContentView(sv);
+              }
+
+              // ---------- UI helpers ----------
+              private int dp(int v) { return (int) (v * getResources().getDisplayMetrics().density); }
+
+              private void label(LinearLayout r, String s) {
+                  TextView t = new TextView(this);
+                  t.setText(s); t.setTextSize(18); t.setPadding(0, dp(16), 0, dp(4));
+                  r.addView(t);
+              }
+
+              private EditText field(LinearLayout r, String hint, String key, boolean secret) {
+                  EditText e = new EditText(this);
+                  e.setHint(hint);
+                  e.setText(sp.getString(key, ""));
+                  e.setTag(key);
+                  if (secret) e.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_PASSWORD);
+                  r.addView(e);
+                  return e;
+              }
+
+              private void btn(LinearLayout r, String s, View.OnClickListener l) {
+                  Button b = new Button(this);
+                  b.setText(s); b.setAllCaps(false); b.setOnClickListener(l);
+                  r.addView(b);
+              }
+
+              private void save() {
+                  sp.edit().putString("url", url.getText().toString().trim())
+                          .putString("token", token.getText().toString().trim())
+                          .putString("number", number.getText().toString().trim())
+                          .putString("delay", delay.getText().toString().trim())
+                          .putString("text", text.getText().toString()).apply();
+              }
+
+              private void msg(String s) { runOnUiThread(() -> status.setText(s)); }
+
+              // ---------- forwarding (opens the dialer; you press Call and pick the SIM) ----------
+              private String num() {
+                  String n = number.getText().toString().replaceAll("[\\s-]", "");
+                  if (n.matches("\\d{10}")) n = "+91" + n;
+                  return n;
+              }
+
+              private int sec() {
+                  int s;
+                  try { s = Integer.parseInt(delay.getText().toString().trim()); } catch (Exception e) { s = 20; }
+                  s = Math.max(5, Math.min(30, s));
+                  return (s / 5) * 5;
+              }
+
+              private void dial(String code) {
+                  save();
+                  if (code.contains("**6") && num().length() < 10) { msg("Enter the virtual number first."); return; }
+                  startActivity(new Intent(Intent.ACTION_DIAL, Uri.parse("tel:" + Uri.encode(code))));
+                  msg("Dialer opened with " + code + "\nPress Call and choose your Airtel/Jio SIM.");
+              }
+
+              // ---------- greeting admin API ----------
+              private void sendText() {
+                  save();
+                  final String t = text.getText().toString();
+                  msg("Generating...");
+                  new Thread(() -> {
+                      try {
+                          byte[] body = new JSONObject().put("text", t).toString().getBytes("UTF-8");
+                          msg("Server replied: " + post("/admin/greeting-text", "application/json", body));
+                      } catch (Exception e) { msg("Error: " + e); }
+                  }).start();
+              }
+
+              @Override protected void onActivityResult(int req, int res, Intent data) {
+                  super.onActivityResult(req, res, data);
+                  if (req != PICK || res != RESULT_OK || data == null) return;
+                  final Uri u = data.getData();
+                  msg("Uploading...");
+                  new Thread(() -> {
+                      try {
+                          InputStream in = getContentResolver().openInputStream(u);
+                          ByteArrayOutputStream f = new ByteArrayOutputStream();
+                          byte[] buf = new byte[8192]; int n;
+                          while ((n = in.read(buf)) > 0) f.write(buf, 0, n);
+                          in.close();
+                          String B = "----vm" + System.currentTimeMillis();
+                          ByteArrayOutputStream body = new ByteArrayOutputStream();
+                          body.write(("--" + B + "\r\nContent-Disposition: form-data; name=\"file\"; "
+                                  + "filename=\"greeting.mp3\"\r\nContent-Type: audio/mpeg\r\n\r\n").getBytes("UTF-8"));
+                          body.write(f.toByteArray());
+                          body.write(("\r\n--" + B + "--\r\n").getBytes("UTF-8"));
+                          msg("Server replied: " + post("/admin/greeting", "multipart/form-data; boundary=" + B, body.toByteArray()));
+                      } catch (Exception e) { msg("Error: " + e); }
+                  }).start();
+              }
+
+              private String post(String path, String type, byte[] body) throws IOException {
+                  String base = url.getText().toString().trim().replaceAll("/+$", "");
+                  HttpURLConnection c = (HttpURLConnection) new URL(base + path).openConnection();
+                  c.setRequestMethod("POST");
+                  c.setDoOutput(true);
+                  c.setConnectTimeout(15000);
+                  c.setReadTimeout(90000);
+                  c.setRequestProperty("Content-Type", type);
+                  c.setRequestProperty("X-Admin-Token", token.getText().toString().trim());
+                  c.setFixedLengthStreamingMode(body.length);
+                  OutputStream os = c.getOutputStream();
+                  os.write(body); os.close();
+                  int code = c.getResponseCode();
+                  return code == 200 ? "OK (200)" : "HTTP " + code;
+              }
+          }
+          EOF
+      - name: Build debug APK
+        working-directory: proj
+        run: gradle assembleDebug --no-daemon
+      - uses: actions/upload-artifact@v4
+        with:
+          name: voicemail-control-apk
+          path: proj/app/build/outputs/apk/debug/app-debug.apk
+      - name: Publish to GitHub Release (easy phone download)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release delete latest --yes --cleanup-tag --repo "$GITHUB_REPOSITORY" || true
+          gh release create latest proj/app/build/outputs/apk/debug/app-debug.apk --repo "$GITHUB_REPOSITORY" --title "Voicemail Control APK" --notes "Debug build" --target "$GITHUB_SHA"
